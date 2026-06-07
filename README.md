@@ -2,6 +2,8 @@
 
 A customizable two‑line status bar for [Claude Code](https://claude.ai/code) that shows model, workspace, git branch, context window progress, token usage, and **session‑based cost accumulation** (¥). Optimized for **DeepSeek models** – automatically fetches your balance and uses correct pricing.
 
+![Claude Code Screenshot](./show.jpg)
+
 ## Features
 
 - **Two‑line layout** – model + dir + branch + progress bar + effort (line 1), tokens + cost (line 2)
