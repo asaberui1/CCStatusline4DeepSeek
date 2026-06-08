@@ -5,7 +5,10 @@
 A customizable two-line status bar for [Claude Code](https://claude.ai/code) that shows model, workspace, git branch, context window progress, token usage, and **session-based cost accumulation (¥)**. Optimized for **DeepSeek models** – automatically fetches your balance and uses correct pricing.
 
 ![Initializing](./fig/Initializing.jpg)
+*Initializing state: single-line display with model, path, branch, progress bar, and effort level — no conversation data yet.*
+
 ![In Use](./fig/InUse.jpg)
+*In-use state: full two-line display — line 1 same as above, line 2 shows cumulative token usage, session cost, and balance.*
 
 ## Features
 
@@ -41,19 +44,6 @@ A customizable two-line status bar for [Claude Code](https://claude.ai/code) tha
 
 Claude Code will automatically run the script and display the status bar. No manual invocation needed.
 
-### Display Modes
-
-The script switches between layouts based on session state:
-
-| State | Lines | Content |
-|-------|-------|---------|
-| Normal conversation | Two lines | line1: model + path + branch + progress bar + effort; line2: tokens + cost + balance |
-| Context rewind (client compaction) | Single line | line1 + balance (if available), token/cost row hidden |
-| New session / no token data, no balance | Single line | line1 with basic info only (model, path, etc.) |
-| New session / no token data, has balance | Single line | line1 + balance |
-
-> During context rewind, a single-line display avoids misleading cost data — rewind is client-side compaction, not a new conversation. Cost was already accumulated before and should not be re-displayed.
-
 ### Color Reference
 
 | Color | Usage |
@@ -73,7 +63,7 @@ The script switches between layouts based on session state:
 | Flash  | ¥1.00              | ¥0.02            | ¥2.00  |
 | Pro    | ¥3.00              | ¥0.025           | ¥6.00  |
 
-Fallback = Flash pricing. Pricing last accessed: 2026-06-07.
+Fallback = Flash pricing. Source: [DeepSeek Pricing Page](https://api-docs.deepseek.com/zh-cn/quick_start/pricing/), last accessed: 2026-06-07.
 
 ## Cost Accumulation Notes
 
