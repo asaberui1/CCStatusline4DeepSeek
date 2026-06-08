@@ -6,16 +6,16 @@ input=$(cat)
 echo "$input" >/tmp/rtk_statusline_latest.json
 
 # === ANSI Colors ===
-RST='\033[0m'
-DIM='\033[90m'
-BOLD='\033[1m'
-CYAN='\033[36m'
-YELLOW='\033[33m'
-GREEN='\033[32m'
-BLUE='\033[34m'
-MAG='\033[35m'
-RED='\033[31m'
-GOLD='\033[38;5;220m'
+RST=$'\033[0m'
+DIM=$'\033[90m'
+BOLD=$'\033[1m'
+CYAN=$'\033[36m'
+YELLOW=$'\033[33m'
+GREEN=$'\033[32m'
+BLUE=$'\033[34m'
+MAG=$'\033[35m'
+RED=$'\033[31m'
+GOLD=$'\033[38;5;220m'
 
 # === Extract JSON fields ===
 model=$(echo "$input" | jq -r '.model.display_name // empty')
@@ -30,6 +30,9 @@ in_tok=$(echo "$input" | jq -r '.context_window.current_usage.input_tokens // em
 out_tok=$(echo "$input" | jq -r '.context_window.current_usage.output_tokens // empty')
 cache_read=$(echo "$input" | jq -r '.context_window.current_usage.cache_read_input_tokens // empty')
 cache_create=$(echo "$input" | jq -r '.context_window.current_usage.cache_creation_input_tokens // empty')
+
+total_in_tok=$(echo "$input" | jq -r '.context_window.total_input_tokens // empty')
+total_out_tok=$(echo "$input" | jq -r '.context_window.total_output_tokens // empty')
 
 # === Model Pricing ===
 case "$model_id" in
@@ -52,53 +55,75 @@ esac
 
 calc_cost() {
   local i=$1 cr=$2 cc=$3 o=$4
+  # 余额来自 DeepSeek API，精确可靠。累计成本基于 token 用量 × 模型定价估算，
+  # 由于无法获取 API 返回的精确账单（尤其是缓存命中/未命中拆分），
+  # 实际成本以 DeepSeek 对账单为准。
   echo "scale=8; ($i * $MISS_RATE + $cr * $HIT_RATE + $cc * $MISS_RATE + $o * $OUT_RATE) / 1000000" |
     bc -l 2>/dev/null | sed 's/^\./0./'
 }
 
-# === Cost-based Accumulator (per-round deltas, model-aware) ===
+# === Cost-based Accumulator (cumulative deltas, model-aware) ===
 ACCUM_FILE="$HOME/.claude/cache/statusline_cost.json"
 mkdir -p "$HOME/.claude/cache"
 
 if [ -f "$ACCUM_FILE" ]; then
   accum=$(cat "$ACCUM_FILE")
+  [ -z "$accum" ] && accum='{}'
 else
   accum='{}'
 fi
 
 session_accum=$(echo "$accum" | jq -r --arg sid "$session_id" '.[$sid] // empty' 2>/dev/null)
 if [ -z "$session_accum" ] || [ "$session_accum" = "null" ]; then
-  session_accum='{"total_cost":0,"last_turn_cost":0,"last_in":0,"last_out":0,"last_cache_read":0,"last_cache_create":0}'
+  session_accum='{"total_cost":0,"prev_in":0,"prev_out":0,"prev_cache_read":0,"prev_cache_create":0,"prev_total_in":0,"prev_total_out":0}'
 fi
 
 re='^[0-9]+$'
 has_new_data=false
-if [[ $out_tok =~ $re ]] && [ "$out_tok" -gt 0 ]; then
-  prev_out=$(echo "$session_accum" | jq -r '.last_out // -1')
-  if [ "$out_tok" != "$prev_out" ] 2>/dev/null; then
-    has_new_data=true
+if [[ $total_out_tok =~ $re ]] && [ "$total_out_tok" -gt 0 ]; then
+  prev_total_out=$(echo "$session_accum" | jq -r '.prev_total_out // 0')
+  [ "$total_out_tok" -gt "$prev_total_out" ] 2>/dev/null && has_new_data=true
+fi
+if ! $has_new_data && [[ $total_in_tok =~ $re ]] && [ "$total_in_tok" -gt 0 ]; then
+  prev_total_in=$(echo "$session_accum" | jq -r '.prev_total_in // 0')
+  [ "$total_in_tok" -gt "$prev_total_in" ] 2>/dev/null && has_new_data=true
+fi
+
+# Read stored values (needed in both branches)
+prev_total_in=$(echo "$session_accum" | jq -r '[.prev_total_in // 0, 0] | max')
+prev_total_out=$(echo "$session_accum" | jq -r '[.prev_total_out // 0, 0] | max')
+prev_cr=$(echo "$session_accum" | jq -r '[.prev_cache_read // 0, 0] | max')
+prev_cc=$(echo "$session_accum" | jq -r '[.prev_cache_create // 0, 0] | max')
+prev_in=$(echo "$session_accum" | jq -r '[.prev_in // 0, 0] | max')
+prev_remaining=$(echo "$session_accum" | jq -r '.prev_remaining // empty')
+
+# === Rewind Detection ===
+# Rewind: curr_in drops (by >10K), total_in unchanged (no API call), remaining doesn't spike
+# (Large remaining spike = client-side compact; total_in increase = API-side compact — both ignored)
+rewind_happened=false
+drop=$((prev_in - in_tok))
+delta_total_in=$((total_in_tok - prev_total_in))
+
+remaining_delta=""
+if [ -n "$prev_remaining" ] && [ -n "$remaining" ] && [ "$remaining" != "null" ]; then
+  remaining_delta=$(echo "$remaining - $prev_remaining" | bc -l 2>/dev/null)
+fi
+
+if [ "$drop" -gt 10000 ] 2>/dev/null; then
+  if [ "$delta_total_in" -le 0 ] 2>/dev/null && [ "$(echo "$remaining_delta <= 20" | bc -l 2>/dev/null)" = "1" ]; then
+    rewind_happened=true
   fi
 fi
 
 if $has_new_data; then
-  prev_in=$(echo "$session_accum" | jq -r '[.last_in // 0, 0] | max')
-  prev_out=$(echo "$session_accum" | jq -r '[.last_out // 0, 0] | max')
-  prev_cr=$(echo "$session_accum" | jq -r '[.last_cache_read // 0, 0] | max')
-  prev_cc=$(echo "$session_accum" | jq -r '[.last_cache_create // 0, 0] | max')
+  # Delta using CUMULATIVE values (accurate for billing)
+  delta_in=$((total_in_tok - prev_total_in))
+  delta_out=$((total_out_tok - prev_total_out))
+  # Cache: only non-negative delta from snapshots (best approximation)
+  [ "$cache_read" -gt "$prev_cr" ] 2>/dev/null && delta_cr=$((cache_read - prev_cr)) || delta_cr=0
+  [ "$cache_create" -gt "$prev_cc" ] 2>/dev/null && delta_cc=$((cache_create - prev_cc)) || delta_cc=0
 
-  # Delta tokens for this round (snapshot comparison)
-  delta_in=$((in_tok - prev_in))
-  delta_out=$((out_tok - prev_out))
-  delta_cr=$((cache_read - prev_cr))
-  delta_cc=$((cache_create - prev_cc))
-
-  # Clamp deltas to non-negative (safety for edge cases)
-  [ "$delta_in" -lt 0 ] && delta_in=0
-  [ "$delta_out" -lt 0 ] && delta_out=0
-  [ "$delta_cr" -lt 0 ] && delta_cr=0
-  [ "$delta_cc" -lt 0 ] && delta_cc=0
-
-  # Delta cost priced at current model's rates
+  # Delta cost
   turn_cost=$(calc_cost "$delta_in" "$delta_cr" "$delta_cc" "$delta_out")
 
   # Accumulate total cost
@@ -108,20 +133,38 @@ if $has_new_data; then
 
   new_entry=$(jq -n \
     --argjson tc "$total_cost" \
-    --argjson ltc "$turn_cost" \
-    --argjson li "$in_tok" --argjson lo "$out_tok" \
-    --argjson lcr "$cache_read" --argjson lcc "$cache_create" \
+    --argjson pi "$in_tok" --argjson po "$out_tok" \
+    --argjson pcr "$cache_read" --argjson pcc "$cache_create" \
+    --argjson pti "$total_in_tok" --argjson pto "$total_out_tok" \
+    --arg pr "$remaining" \
     '{
-            total_cost: $tc,
-            last_turn_cost: $ltc,
-            last_in: $li, last_out: $lo,
-            last_cache_read: $lcr, last_cache_create: $lcc
-        }')
+      total_cost: $tc,
+      prev_in: $pi, prev_out: $po,
+      prev_cache_read: $pcr, prev_cache_create: $pcc,
+      prev_total_in: $pti, prev_total_out: $pto,
+      prev_remaining: ($pr | tonumber? // 0)
+    }')
   echo "$accum" | jq --arg sid "$session_id" --argjson ne "$new_entry" \
     '.[$sid] = $ne' >"$ACCUM_FILE"
 else
   total_cost=$(echo "$session_accum" | jq -r '.total_cost // 0')
-  turn_cost=$(echo "$session_accum" | jq -r '.last_turn_cost // 0')
+  # On rewind: update snapshots so next prompt doesn't false-positive as rewind
+  if $rewind_happened; then
+    new_entry=$(jq -n \
+      --argjson tc "$total_cost" \
+      --argjson pi "$in_tok" --argjson po "$out_tok" \
+      --argjson pcr "$cache_read" --argjson pcc "$cache_create" \
+      --argjson pti "$total_in_tok" --argjson pto "$total_out_tok" \
+      --arg pr "$remaining" \
+      '{
+        total_cost: $tc, prev_in: $pi, prev_out: $po,
+        prev_cache_read: $pcr, prev_cache_create: $pcc,
+        prev_total_in: $pti, prev_total_out: $pto,
+        prev_remaining: ($pr | tonumber? // 0)
+      }')
+    echo "$accum" | jq --arg sid "$session_id" --argjson ne "$new_entry" \
+      '.[$sid] = $ne' >"$ACCUM_FILE"
+  fi
 fi
 
 safe_val() {
@@ -132,6 +175,8 @@ in_tok=$(safe_val "$in_tok")
 out_tok=$(safe_val "$out_tok")
 cache_read=$(safe_val "$cache_read")
 cache_create=$(safe_val "$cache_create")
+total_in_tok=$(safe_val "$total_in_tok")
+total_out_tok=$(safe_val "$total_out_tok")
 
 cumul_cost=$total_cost
 
@@ -173,7 +218,7 @@ pad_l() {
 
 format_num() {
   local n=$1
-  if [ -z "$n" ] || [ "$n" = "0" ]; then
+  if [ -z "$n" ]; then
     echo ""
     return
   fi
@@ -198,37 +243,39 @@ fmt_cost_fixed() {
     echo ""
     return
   fi
-  local r
   if [ "$(echo "$c >= 1" | bc -l 2>/dev/null)" = "1" ]; then
-    r=$(printf "%.2f" "$c")
+    printf "¥%.2f" "$c"
   else
-    r=$(printf "%.4f" "$c")
-    r=$(echo "$r" | sed 's/0\{1,2\}$//')
-    [[ "$r" == *"." ]] && r="${r}00"
+    printf "¥%.4f" "$c"
   fi
-  echo "¥$r"
 }
 
 # Get git branch
 branch=""
-if [ -n "$cwd" ] && [ -d "$cwd/.git" ]; then
+if [ -n "$cwd" ]; then
   branch=$(GIT_OPTIONAL_LOCKS=0 git -C "$cwd" symbolic-ref --short HEAD 2>/dev/null || true)
 fi
 
-# === Progress Bar: 24 blocks ===
-# ██ = remaining (colored), ░░ = used (gray)
-# Format: ████████████████████░░░░ 82.9%
+# Git root path highlighting — bold the repo root dir name in cwd
+git_root_dir=""
+if [ -n "$cwd" ] && [ -n "$branch" ]; then
+  git_root=$(GIT_OPTIONAL_LOCKS=0 git -C "$cwd" rev-parse --show-toplevel 2>/dev/null || true)
+  if [ -n "$git_root" ]; then
+    git_root_dir=$(basename "$git_root")
+  fi
+fi
+
+# === Progress Bar: 16 blocks ===
+# █ = remaining (colored), ░ = used (gray)
 make_progress_bar() {
   local pct=$1
+  local marker=$2  # optional marker shown after percentage
   if [ -z "$pct" ]; then
     echo ""
     return
   fi
 
-  # 16 blocks total (fits well on one line)
   local total=16
-  # pct is remaining percentage, calculate filled blocks
-  # Use awk for float math
   local filled
   filled=$(awk -v p="$pct" -v t="$total" 'BEGIN { printf "%d", (p * t / 100) + 0.5 }' 2>/dev/null)
   [ -z "$filled" ] && filled=0
@@ -236,7 +283,6 @@ make_progress_bar() {
   [ "$filled" -lt 0 ] && filled=0
   local empty=$((total - filled))
 
-  # Color based on remaining percentage
   local bar_color=$GREEN
   if [ "$(echo "$pct >= 50" | bc -l 2>/dev/null)" = "1" ]; then
     bar_color=$GREEN
@@ -248,34 +294,34 @@ make_progress_bar() {
 
   local bar=""
   local i
-  # Remaining portion (right side) — colored blocks █
   for ((i = 0; i < filled; i++)); do
     bar="${bar}${bar_color}█${RST}"
   done
-  # Used portion (left side) — gray shade ░
   for ((i = 0; i < empty; i++)); do
     bar="${bar}${DIM}░${RST}"
   done
 
-  # Percentage after bar, 1 decimal
   local pct_str
   pct_str=$(printf "%.1f%%" "$pct")
-  echo "$bar ${pct_str}"
+  echo "${bar} ${pct_str}${marker}"
 }
 
 # === Build display ===
 
-# Token numbers fixed-width (right-aligned to 6)
-in_fmt=$(format_num "$in_tok")
-in_pad=$(pad_r "${in_fmt:-}" 6)
-out_fmt=$(format_num "$out_tok")
-out_pad=$(pad_r "${out_fmt:-}" 6)
+# Cumulative token totals (from total_* — matches API)
+total_in_fmt=$(format_num "$total_in_tok")
+total_in_pad=$(pad_r "${total_in_fmt:-}" 6)
+total_out_fmt=$(format_num "$total_out_tok")
+total_out_pad=$(pad_r "${total_out_fmt:-}" 6)
+
+# Cache — show "0" instead of blank when cache is zero
 cr_fmt=$(format_num "$cache_read")
+if [ -z "$cr_fmt" ] && { [ "$cache_read" -eq 0 ] 2>/dev/null; }; then
+  cr_fmt="0"
+fi
 cr_pad=$(pad_r "${cr_fmt:-}" 6)
 
-# Cost fixed-width
-turn_c=$(fmt_cost_fixed "$turn_cost")
-turn_pad=$(pad_l "${turn_c:-}" 8)
+# Cost
 cumul_c=$(fmt_cost_fixed "$cumul_cost")
 cumul_pad=$(pad_l "${cumul_c:-}" 8)
 
@@ -291,14 +337,23 @@ line1=""
 # Model
 [ -n "$model" ] && line1="${BOLD}${CYAN}${model}${RST}"
 
-# Dir
-[ -n "$short_dir" ] && line1="$line1  ${YELLOW}${short_dir}${RST}"
+# Dir with git root highlighted
+if [ -n "$short_dir" ]; then
+  if [ -n "$git_root_dir" ]; then
+    # Bold the git root directory name in the path
+    bold_dir=$(echo "$short_dir" | sed \
+      -e "s|/$git_root_dir/|/${BOLD}${git_root_dir}${RST}${YELLOW}/|g" \
+      -e "s|/$git_root_dir\$|/${BOLD}${git_root_dir}${RST}|g" \
+      -e "s|^$git_root_dir/|${BOLD}${git_root_dir}${RST}${YELLOW}/|g")
+    line1="$line1  ${YELLOW}${bold_dir}${RST}"
+  else
+    line1="$line1  ${YELLOW}${short_dir}${RST}"
+  fi
+fi
 
 # Branch
 [ -n "$branch" ] && line1="$line1  ${GREEN}${branch}${RST}"
 
-# Session name
-[ -n "$session" ] && line1="$line1 ${DIM}[${session}]${RST}"
 
 # Right side: progress bar + effort
 if [ -n "$bar" ]; then
@@ -317,38 +372,47 @@ if [ -n "$effort" ]; then
 fi
 
 # ====================
-# LINE 2: Token usage + cost
+# LINE 2: Token usage + cost + balance
 # ====================
-has_token_data=false
+has_tokens=false
 line2=""
 
-if [ -n "$in_fmt" ] || [ -n "$out_fmt" ] || [ -n "$cr_fmt" ]; then
-  has_token_data=true
-  line2="${line2}输入${BLUE}${in_pad}${RST}  输出${MAG}${out_pad}${RST}  缓存${GREEN}${cr_pad}${RST}"
+# Use numeric values (not formatted) to distinguish "no data" from "zero"
+if [ "$total_in_tok" -gt 0 ] 2>/dev/null || [ "$total_out_tok" -gt 0 ] 2>/dev/null || [ "$cache_read" -gt 0 ] 2>/dev/null; then
+  has_tokens=true
+  line2="累计输入 ${BLUE}${total_in_pad}${RST}  累计输出 ${MAG}${total_out_pad}${RST}  当前缓存 ${GREEN}${cr_pad}${RST}"
 fi
 
-if $has_token_data; then
+if $has_tokens; then
   cost_line="  ${DIM}|${RST}"
-  # 本轮: fallback to ¥0 on zero-cost refresh
-  display_turn="${turn_c:-¥0}"
-  turn_pad=$(pad_l "${display_turn}" 8)
-  cost_line="${cost_line} 本轮${GOLD}${turn_pad}${RST}"
-  # 累计
   if [ -n "$cumul_c" ]; then
-    cost_line="${cost_line}  累计${GOLD}${cumul_pad}${RST}"
+    cost_line="${cost_line}  累计 ${GOLD}${cumul_pad}${RST}"
   fi
-  # 余额
   if [ -n "$balance" ]; then
     bal_fmt=$(printf "¥%.2f" "$balance" 2>/dev/null)
     bal_pad=$(pad_l "${bal_fmt}" 10)
-    cost_line="${cost_line}  余额${GOLD}${bal_pad}${RST}"
+    cost_line="${cost_line}  余额 ${GOLD}${bal_pad}${RST}"
   fi
-  line2="$line2${cost_line}"
+  line2="${line2}${cost_line}"
 fi
 
 # === Final output ===
-if $has_token_data; then
+has_balance=false
+[ -n "$balance" ] && has_balance=true
+
+if $rewind_happened; then
+  # Rewind to start — single line (initialization style)
+  if $has_balance; then
+    bal_fmt=$(printf "¥%.2f" "$balance" 2>/dev/null)
+    echo -e "$line1  ${GOLD}余额 ${bal_fmt}${RST}"
+  else
+    echo -e "$line1"
+  fi
+elif $has_tokens; then
   echo -e "$line1\n$line2"
+elif $has_balance; then
+  bal_fmt=$(printf "¥%.2f" "$balance" 2>/dev/null)
+  echo -e "$line1  ${GOLD}余额 ${bal_fmt}${RST}"
 else
   echo -e "$line1"
 fi
